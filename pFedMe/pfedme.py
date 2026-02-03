@@ -18,9 +18,9 @@ def one_hot(y, num_classes):
     return np.eye(num_classes)[y]
 
 class Config:
-    def __init__(self, num_clients=20, num_global_rounds=200, num_local_rounds=5, 
+    def __init__(self, num_clients=20, num_global_rounds=800, num_local_rounds=5, 
                  batch_size=20, lambda_val=15.0, lr=0.005, beta=1.0, 
-                 k_inner_steps=5, dimension=20, num_classes=5, hidden_size=20):
+                 k_inner_steps=5, dimension=20, num_classes=5, hidden_size=20, weight_decay=0.001):
         self.num_clients = num_clients
         self.num_global_rounds = num_global_rounds
         self.num_local_rounds = num_local_rounds
@@ -32,6 +32,7 @@ class Config:
         self.dimension = dimension
         self.num_classes = num_classes
         self.hidden_size = hidden_size
+        self.weight_decay = weight_decay
 
 class Client:
     def __init__(self, id, config, X_train, y_train, X_test, y_test, model_type="MLR"):
@@ -85,8 +86,7 @@ class Client:
             # We can add a small native L2 regularization if desired, but pFedMe adds ||theta - w||^2.
             # "Strongly convex" usually implies f_i itself is strongly convex.
             # Adding L2 to f_i:
-            l2_reg_strength = 0.001 
-            grad_W += l2_reg_strength * W
+            grad_W += self.config.weight_decay * W
             
             return grad_W.flatten()
             
@@ -121,9 +121,8 @@ class Client:
         loss = np.sum(correct_logprobs) / m
         
         if self.model_type == "MLR":
-             l2_reg_strength = 0.001
              W = theta_flat.reshape(self.param_shape)
-             loss += 0.5 * l2_reg_strength * np.sum(W**2)
+             loss += 0.5 * self.config.weight_decay * np.sum(W**2)
              
         return loss
 
@@ -151,12 +150,16 @@ class Client:
     def find_personalized_theta(self, w_ref):
         theta_curr = np.copy(self.w_local)
         
-        # Use simple full batch for inner steps or mini-batch
-        # Using full local train data for simplicity
-        indices = np.arange(len(self.y_train))
+        # Sample a fresh mini-batch D_i for the inner minimization as per Alg 1 Line 7
+        n_samples = len(self.y_train)
+        batch_size = min(self.config.batch_size, n_samples)
+        indices = np.random.choice(n_samples, batch_size, replace=False)
+        
+        X_batch = self.X_train[indices]
+        y_batch = self.y_train[indices]
         
         for k in range(self.config.k_inner_steps):
-            grad_f = self.get_gradients(theta_curr, self.X_train, self.y_train)
+            grad_f = self.get_gradients(theta_curr, X_batch, y_batch)
             grad_prox = self.config.lambda_val * (theta_curr - w_ref)
             theta_curr = theta_curr - self.config.lr * (grad_f + grad_prox)
             
@@ -318,28 +321,46 @@ if __name__ == "__main__":
     if "DISPLAY" not in os.environ:
         plt.switch_backend('Agg')
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    # Ensure figures dir exists
+    os.makedirs("figures", exist_ok=True)
     
-    # Plot Training Loss
-    ax1.plot(loss_mlr, label="MLR (Convex)")
-    ax1.plot(loss_dnn, label="DNN (Non-Convex)")
-    ax1.set_title("Training Loss")
-    ax1.set_xlabel("Rounds")
-    ax1.set_ylabel("loss")
-    ax1.set_yscale("log")
-    ax1.legend()
-    ax1.grid(True)
+    fig, axs = plt.subplots(1, 4, figsize=(24, 6))
     
-    # Plot Test Accuracy
-    ax2.plot(acc_mlr, label="MLR (Convex)")
-    ax2.plot(acc_dnn, label="DNN (Non-Convex)")
-    ax2.set_title("Test Accuracy")
-    ax2.set_xlabel("Rounds")
-    ax2.set_ylabel("Accuracy")
-    ax2.legend()
-    ax2.grid(True)
+    # Plot 1: Test Accuracy (Strongly Convex)
+    axs[0].plot(acc_mlr, label="pFedMe", marker='v', markevery=50)
+    axs[0].set_title("$\mu$-Strongly Convex (Accuracy)")
+    axs[0].set_xlabel("Global rounds")
+    axs[0].set_ylabel("Test Accuracy")
+    axs[0].grid(True)
+    axs[0].legend()
     
-    output_plot = "pfedme_classification_results.png"
+    # Plot 2: Test Accuracy (Non-Convex)
+    axs[1].plot(acc_dnn, label="pFedMe", marker='o', markevery=50, color='tab:orange')
+    axs[1].set_title("Non-Convex (Accuracy)")
+    axs[1].set_xlabel("Global rounds")
+    axs[1].set_ylabel("Test Accuracy")
+    axs[1].grid(True)
+    axs[1].legend()
+    
+    # Plot 3: Training Loss (Strongly Convex)
+    axs[2].plot(loss_mlr, label="pFedMe", marker='v', markevery=50)
+    axs[2].set_title("$\mu$-Strongly Convex (Loss)")
+    axs[2].set_xlabel("Global rounds")
+    axs[2].set_ylabel("Training Loss")
+    axs[2].set_yscale("log")
+    axs[2].grid(True)
+    axs[2].legend()
+    
+    # Plot 4: Training Loss (Non-Convex)
+    axs[3].plot(loss_dnn, label="pFedMe", marker='o', markevery=50, color='tab:orange')
+    axs[3].set_title("Non-Convex (Loss)")
+    axs[3].set_xlabel("Global rounds")
+    axs[3].set_ylabel("Training Loss")
+    axs[3].set_yscale("log")
+    axs[3].grid(True)
+    axs[3].legend()
+    
+    output_plot = "figures/pfedme_combined_results.png"
     plt.tight_layout()
     plt.savefig(output_plot)
     print(f"\nSimulation complete. Results saved to {output_plot}")
