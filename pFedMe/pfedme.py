@@ -3,92 +3,172 @@ import copy
 import matplotlib.pyplot as plt
 import os
 
+def softmax(z):
+    # Stabilized softmax
+    exp_z = np.exp(z - np.max(z, axis=1, keepdims=True))
+    return exp_z / np.sum(exp_z, axis=1, keepdims=True)
+
+def relu(z):
+    return np.maximum(0, z)
+
+def relu_deriv(z):
+    return (z > 0).astype(float)
+
+def one_hot(y, num_classes):
+    return np.eye(num_classes)[y]
+
 class Config:
-    def __init__(self, num_clients=20, num_global_rounds=50, num_local_rounds=5, 
-                 start_batch_size=20, lambda_val=15.0, lr=0.05, beta=1.0, 
-                 k_inner_steps=5, dimension=10, data_per_client=30):
+    def __init__(self, num_clients=20, num_global_rounds=200, num_local_rounds=5, 
+                 batch_size=20, lambda_val=15.0, lr=0.01, beta=1.0, 
+                 k_inner_steps=5, dimension=20, num_classes=5, hidden_size=20):
         self.num_clients = num_clients
         self.num_global_rounds = num_global_rounds
         self.num_local_rounds = num_local_rounds
-        self.batch_size = start_batch_size
-        self.lambda_val = lambda_val  # Lambda for Moreau Envelope regularization
-        self.lr = lr  # Learning rate (eta)
-        self.beta = beta  # Beta for global averaging
-        self.k_inner_steps = k_inner_steps # Number of gradient descent steps to solve inner problem
+        self.batch_size = batch_size
+        self.lambda_val = lambda_val
+        self.lr = lr
+        self.beta = beta
+        self.k_inner_steps = k_inner_steps
         self.dimension = dimension
-        self.data_per_client = data_per_client
+        self.num_classes = num_classes
+        self.hidden_size = hidden_size
 
 class Client:
-    def __init__(self, id, config, X, y, task_type="high_convexity"):
+    def __init__(self, id, config, X_train, y_train, X_test, y_test, model_type="MLR"):
         self.id = id
         self.config = config
-        self.X = X
-        self.y = y
-        self.task_type = task_type
-        self.w_local = np.zeros(config.dimension)  # Local model parameter w_{i,r}
-        self.theta = np.zeros(config.dimension)    # Personalized parameter theta_i
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_test = X_test
+        self.y_test = y_test
+        self.model_type = model_type
         
-    def loss_function(self, theta, batch_idx):
-        # f_i(theta)
-        X_batch = self.X[batch_idx]
-        y_batch = self.y[batch_idx]
+        # Initialize model parameters based on type
+        if self.model_type == "MLR":
+            # W: (dimension, num_classes)
+            # Flattened for optimizer: (dimension * num_classes,)
+            self.param_shape = (config.dimension, config.num_classes)
+            self.num_params = config.dimension * config.num_classes
         
-        if self.task_type == "high_convexity" or self.task_type == "low_convexity":
-            # Linear Regression / Quadratic Objective: 0.5 * ||X*theta - y||^2
-            predictions = X_batch @ theta
-            residuals = predictions - y_batch
-            return 0.5 * np.mean(residuals**2) 
-        
-        return 0
-
-    def gradient_function(self, theta, batch_idx):
-        # \nabla f_i(theta)
-        X_batch = self.X[batch_idx]
-        y_batch = self.y[batch_idx]
-        
-        if self.task_type == "high_convexity" or self.task_type == "low_convexity":
-            # Grad: X^T (X*theta - y) / N
-            predictions = X_batch @ theta
-            residuals = predictions - y_batch
-            return (X_batch.T @ residuals) / len(y_batch)
+        elif self.model_type == "DNN":
+            # Layer 1: W1 (dimension, hidden)
+            # Layer 2: W2 (hidden, num_classes)
+            # Biases omitted for simplicity as per common FL benchmarks or treated as part of input
+            # We will flatten all params into a single vector
+            self.w1_shape = (config.dimension, config.hidden_size)
+            self.w2_shape = (config.hidden_size, config.num_classes)
+            self.num_params = (config.dimension * config.hidden_size) + (config.hidden_size * config.num_classes)
             
-        return np.zeros_like(theta)
+        self.w_local = np.random.randn(self.num_params) * 0.01
+        self.theta = np.copy(self.w_local)
+        
+    def get_gradients(self, theta_flat, X, y):
+        # Helper to compute gradients for a batch
+        m = len(y)
+        y_oh = one_hot(y, self.config.num_classes)
+        
+        if self.model_type == "MLR":
+            # Unpack
+            W = theta_flat.reshape(self.param_shape)
+            
+            # Forward
+            logits = X @ W
+            probs = softmax(logits)
+            
+            # Gradient: X.T @ (probs - y_oh) / m + L2 reg ?
+            # Note: The proximal term handles heavy lifting, but stronger convexity often includes L2 in f_i.
+            # Plan said: CrossEntropy + L2.
+            # Grad = (1/m) * X.T(P - Y) + lambda_l2 * W
+            diff = probs - y_oh
+            grad_W = (X.T @ diff) / m 
+            
+            # We can add a small native L2 regularization if desired, but pFedMe adds ||theta - w||^2.
+            # "Strongly convex" usually implies f_i itself is strongly convex.
+            # Adding L2 to f_i:
+            l2_reg_strength = 0.001 
+            grad_W += l2_reg_strength * W
+            
+            return grad_W.flatten()
+            
+        elif self.model_type == "DNN":
+            # Unpack
+            size_w1 = self.w1_shape[0] * self.w1_shape[1]
+            W1 = theta_flat[:size_w1].reshape(self.w1_shape)
+            W2 = theta_flat[size_w1:].reshape(self.w2_shape)
+            
+            # Forward
+            Z1 = X @ W1
+            A1 = relu(Z1)
+            Z2 = A1 @ W2
+            probs = softmax(Z2)
+            
+            # Backprop
+            delta2 = probs - y_oh
+            dW2 = (A1.T @ delta2) / m
+            
+            delta1 = (delta2 @ W2.T) * relu_deriv(Z1)
+            dW1 = (X.T @ delta1) / m
+            
+            return np.concatenate((dW1.flatten(), dW2.flatten()))
+            
+        return np.zeros_like(theta_flat)
+
+    def loss_function(self, theta_flat, X, y):
+        # Just Cross Entropy (+ L2 if MLR)
+        probs = self.predict_probs(theta_flat, X)
+        m = len(y)
+        correct_logprobs = -np.log(probs[np.arange(m), y] + 1e-9)
+        loss = np.sum(correct_logprobs) / m
+        
+        if self.model_type == "MLR":
+             l2_reg_strength = 0.001
+             W = theta_flat.reshape(self.param_shape)
+             loss += 0.5 * l2_reg_strength * np.sum(W**2)
+             
+        return loss
+
+    def predict_probs(self, theta_flat, X):
+        if self.model_type == "MLR":
+            W = theta_flat.reshape(self.param_shape)
+            return softmax(X @ W)
+        elif self.model_type == "DNN":
+            size_w1 = self.w1_shape[0] * self.w1_shape[1]
+            W1 = theta_flat[:size_w1].reshape(self.w1_shape)
+            W2 = theta_flat[size_w1:].reshape(self.w2_shape)
+            Z1 = X @ W1
+            A1 = relu(Z1)
+            Z2 = A1 @ W2
+            return softmax(Z2)
+        return np.zeros((len(X), self.config.num_classes))
+
+    def evaluate(self, theta_flat, X, y):
+        probs = self.predict_probs(theta_flat, X)
+        preds = np.argmax(probs, axis=1)
+        acc = np.mean(preds == y)
+        loss = self.loss_function(theta_flat, X, y)
+        return loss, acc
 
     def find_personalized_theta(self, w_ref):
-        """
-        Solves the inner problem to find approx theta_i.
-        min L(theta) + lambda/2 ||theta - w_ref||^2
-        """
-        theta_curr = np.copy(self.w_local) # Warm start with local model
+        theta_curr = np.copy(self.w_local)
         
-        # Use full batch for demo stability
-        indices = np.arange(len(self.y)) 
+        # Use simple full batch for inner steps or mini-batch
+        # Using full local train data for simplicity
+        indices = np.arange(len(self.y_train))
         
         for k in range(self.config.k_inner_steps):
-            grad_f = self.gradient_function(theta_curr, indices)
-            # Gradient of the proximal term: lambda * (theta - w_ref)
+            grad_f = self.get_gradients(theta_curr, self.X_train, self.y_train)
             grad_prox = self.config.lambda_val * (theta_curr - w_ref)
-            
-            # Update theta
-            # Optimization step for inner problem
             theta_curr = theta_curr - self.config.lr * (grad_f + grad_prox)
             
         return theta_curr
 
     def local_training(self, w_global):
-        """
-        Performs R rounds of local updates.
-        """
-        self.w_local = np.copy(w_global) # Initialize w_{i,0} with w_global
+        self.w_local = np.copy(w_global)
         
         for r in range(self.config.num_local_rounds):
-            # Step 1: Find Personalized Model \theta
-            # argmin { f_i(theta) + lambda/2 ||theta - w_{i,r}||^2 }
             self.theta = self.find_personalized_theta(self.w_local)
             
-            # Step 2: Update Local Model w (pFedMe update rule)
-            # w_{i, r+1} = w_{i,r} - eta * lambda * (w_{i,r} - theta_i)
-            # Note: The gradient of the envelope function approx is lambda * (w - theta)
+            # pFedMe update
             grad_envelope = self.config.lambda_val * (self.w_local - self.theta)
             self.w_local = self.w_local - self.config.lr * grad_envelope
             
@@ -97,133 +177,169 @@ class Client:
 class Server:
     def __init__(self, config):
         self.config = config
-        self.w_global = np.zeros(config.dimension)
+        # Global model init depends on model type, decided by first client usually or passed config
+        # We'll determine num_params from config
+        if config.hidden_size > 0: # Proxy for DNN
+             num_params = (config.dimension * config.hidden_size) + (config.hidden_size * config.num_classes)
+        else: # MLR
+             num_params = config.dimension * config.num_classes
+             
+        self.w_global = np.random.randn(num_params) * 0.01
         self.clients = []
         
     def add_client(self, client):
         self.clients.append(client)
-        
+        # Resize global if needed (for safety, though we assume consistent config)
+        if len(self.w_global) != client.num_params:
+            self.w_global = np.zeros(client.num_params)
+
     def aggregate(self, client_models):
-        # pFedMe Global Update:
-        # w_{t+1} = (1 - beta) * w_t + beta * (sum(w_{i,R}) / S)
         if not client_models:
             return
-            
         avg_client_model = np.mean(client_models, axis=0)
         self.w_global = (1 - self.config.beta) * self.w_global + self.config.beta * avg_client_model
 
     def train(self):
-        loss_history = []
+        train_loss_hist = []
+        test_acc_hist = []
+        
         print(f"Starting Training for {self.config.num_global_rounds} rounds...")
         
         for t in range(self.config.num_global_rounds):
             local_weights = []
-            personal_losses = []
             
-            # Simulate client sampling (using all for demo)
-            active_clients = self.clients
+            # Metrics for this round
+            round_train_losses = []
+            round_test_accs = []
             
-            for client in active_clients:
+            for client in self.clients:
+                # Local Update
                 w_local_final, theta_final = client.local_training(self.w_global)
                 local_weights.append(w_local_final)
                 
-                # Monitor personalization loss
-                loss = client.loss_function(theta_final, np.arange(len(client.y)))
-                personal_losses.append(loss)
+                # Evaluation (using Personalized Model theta)
+                # "Personalized FL" -> Evaluate personalized models
+                tr_loss, _ = client.evaluate(theta_final, client.X_train, client.y_train)
+                _, te_acc = client.evaluate(theta_final, client.X_test, client.y_test)
+                
+                round_train_losses.append(tr_loss)
+                round_test_accs.append(te_acc)
             
-            # Server update
+            # Server Aggregation
             self.aggregate(local_weights)
             
-            avg_loss = np.mean(personal_losses)
-            loss_history.append(avg_loss)
+            avg_tr_loss = np.mean(round_train_losses)
+            avg_te_acc = np.mean(round_test_accs)
+            
+            train_loss_hist.append(avg_tr_loss)
+            test_acc_hist.append(avg_te_acc)
             
             if (t+1) % 10 == 0:
-                print(f"Round {t+1}: Avg Personalized Loss = {avg_loss:.4f}")
+                print(f"Round {t+1}: Train Loss={avg_tr_loss:.4f}, Test Acc={avg_te_acc:.4f}")
                 
-        return loss_history
+        return train_loss_hist, test_acc_hist
 
-def generate_data(num_clients, dimension, data_per_client, condition_number=1.0, noise_level=0.1):
+def generate_classification_data(num_clients, dimension, num_classes, data_per_client, condition_number=1.0):
     """
-    Generates synthetic regression data.
-    condition_number: Controls convexity.
+    Generates synthetic classification data.
+    Uses a simple linear generative model y = argmax(Wx) then adds noise/flip labels or uses clusters.
+    To control convexity, we really control the feature spread/conditioning.
     """
     clients_data = []
-    # Ground truth model
-    true_w = np.random.randn(dimension)
+    
+    # Random true weight
+    W_true = np.random.randn(dimension, num_classes)
     
     # Scale vector for ill-conditioning
-    # Singular values will range from 1 to sqrt(condition_number)
-    # Actually, to make condition number K, we want max_eig/min_eig = K.
-    # So range from 1 to sqrt(K) for X gives K for X^T X.
-    scale_vector = np.linspace(1, np.sqrt(condition_number), dimension)
+    scale = np.linspace(1, np.sqrt(condition_number), dimension)
     
     for i in range(num_clients):
         # Generate X
         X = np.random.randn(data_per_client, dimension)
-        # Apply scaling to columns to affect condition number
-        X = X * scale_vector
+        X = X * scale # Ill-conditioning
         
-        # y = Xw + epsilon
-        y = X @ true_w + np.random.randn(data_per_client) * noise_level
-        clients_data.append((X, y))
+        # Generate Y
+        logits = X @ W_true
+        # Add noise
+        logits += np.random.randn(data_per_client, num_classes) * 0.5
+        y = np.argmax(logits, axis=1)
+        
+        # Split 75/25
+        n_train = int(0.75 * data_per_client)
+        X_train, X_test = X[:n_train], X[n_train:]
+        y_train, y_test = y[:n_train], y[n_train:]
+        
+        clients_data.append((X_train, y_train, X_test, y_test))
         
     return clients_data
 
-def run_example_high_convexity():
-    print("\n=== Running Example 1: High Convexity (Well-conditioned) ===")
-    cfg = Config() # Fixed: removed unexpected argument
+def run_mlr_experiment():
+    print("\n=== Running Strongly Convex (MLR) Experiment ===")
+    cfg = Config(num_global_rounds=100, dimension=20, num_classes=5, hidden_size=0) # Hidden=0 -> MLR
     cfg.lr = 0.05
     
-    data = generate_data(
-        num_clients=cfg.num_clients, 
-        dimension=cfg.dimension, 
-        data_per_client=cfg.data_per_client, 
-        condition_number=1.0, 
-        noise_level=0.1
+    data = generate_classification_data(
+        cfg.num_clients, cfg.dimension, cfg.num_classes, 
+        data_per_client=100, condition_number=1.0
     )
     
     server = Server(cfg)
-    for i, (X, y) in enumerate(data):
-        server.add_client(Client(i, cfg, X, y, task_type="high_convexity"))
+    for i, (Xt, yt, Xv, yv) in enumerate(data):
+        server.add_client(Client(i, cfg, Xt, yt, Xv, yv, model_type="MLR"))
         
     return server.train()
 
-def run_example_low_convexity():
-    print("\n=== Running Example 2: Low Convexity (Ill-conditioned) ===")
-    cfg = Config()
-    cfg.lr = 0.01 # Lower LR for stability on ill-conditioned problem
+def run_dnn_experiment():
+    print("\n=== Running Non-Convex (DNN) Experiment ===")
+    # DNN: Hidden=20, ReLU, Softmax
+    cfg = Config(num_global_rounds=100, dimension=20, num_classes=5, hidden_size=20)
+    cfg.lr = 0.05
     
-    data = generate_data(
-        num_clients=cfg.num_clients, 
-        dimension=cfg.dimension, 
-        data_per_client=cfg.data_per_client, 
-        condition_number=100.0, # High condition number
-        noise_level=0.1
+    # Use ill-conditioned data to make it harder? Or just standard?
+    # User asked for "Non-Convex" case. Neural net is inherently non-convex.
+    data = generate_classification_data(
+        cfg.num_clients, cfg.dimension, cfg.num_classes, 
+        data_per_client=100, condition_number=10.0
     )
     
     server = Server(cfg)
-    for i, (X, y) in enumerate(data):
-        server.add_client(Client(i, cfg, X, y, task_type="low_convexity"))
+    for i, (Xt, yt, Xv, yv) in enumerate(data):
+        server.add_client(Client(i, cfg, Xt, yt, Xv, yv, model_type="DNN"))
         
     return server.train()
 
 if __name__ == "__main__":
-    hist_high = run_example_high_convexity()
-    hist_low = run_example_low_convexity()
+    # 1. Strongly Convex (MLR)
+    loss_mlr, acc_mlr = run_mlr_experiment()
+    
+    # 2. Non-Convex (DNN)
+    loss_dnn, acc_dnn = run_dnn_experiment()
     
     if "DISPLAY" not in os.environ:
         plt.switch_backend('Agg')
-        
-    plt.figure(figsize=(10, 6))
-    plt.plot(hist_high, label="High Convexity (Cond=1)", marker='o', markevery=5)
-    plt.plot(hist_low, label="Low Convexity (Cond=100)", marker='x', markevery=5)
-    plt.title("pFedMe Convergence: High vs Low Convexity")
-    plt.xlabel("Global Rounds")
-    plt.ylabel("Avg Personalized Loss")
-    plt.yscale("log")
-    plt.legend()
-    plt.grid(True)
     
-    output_plot = "pfedme_results.png"
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Plot Training Loss
+    ax1.plot(loss_mlr, label="MLR (Convex)")
+    ax1.plot(loss_dnn, label="DNN (Non-Convex)")
+    ax1.set_title("Training Loss")
+    ax1.set_xlabel("Rounds")
+    ax1.set_ylabel("loss")
+    ax1.set_yscale("log")
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Plot Test Accuracy
+    ax2.plot(acc_mlr, label="MLR (Convex)")
+    ax2.plot(acc_dnn, label="DNN (Non-Convex)")
+    ax2.set_title("Test Accuracy")
+    ax2.set_xlabel("Rounds")
+    ax2.set_ylabel("Accuracy")
+    ax2.legend()
+    ax2.grid(True)
+    
+    output_plot = "pfedme_classification_results.png"
+    plt.tight_layout()
     plt.savefig(output_plot)
-    print(f"\nSimulation complete. Plot saved to {output_plot}")
+    print(f"\nSimulation complete. Results saved to {output_plot}")
