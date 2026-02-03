@@ -19,7 +19,7 @@ def one_hot(y, num_classes):
 
 class Config:
     def __init__(self, num_clients=20, num_global_rounds=200, num_local_rounds=5, 
-                 batch_size=20, lambda_val=15.0, lr=0.01, beta=1.0, 
+                 batch_size=20, lambda_val=15.0, lr=0.005, beta=1.0, 
                  k_inner_steps=5, dimension=20, num_classes=5, hidden_size=20):
         self.num_clients = num_clients
         self.num_global_rounds = num_global_rounds
@@ -276,7 +276,7 @@ def generate_classification_data(num_clients, dimension, num_classes, data_per_c
 def run_mlr_experiment():
     print("\n=== Running Strongly Convex (MLR) Experiment ===")
     cfg = Config(num_global_rounds=800, dimension=20, num_classes=5, hidden_size=0) # Hidden=0 -> MLR
-    cfg.lr = 0.05
+    cfg.lr = 0.005
     
     data = generate_classification_data(
         cfg.num_clients, cfg.dimension, cfg.num_classes, 
@@ -293,7 +293,7 @@ def run_dnn_experiment():
     print("\n=== Running Non-Convex (DNN) Experiment ===")
     # DNN: Hidden=20, ReLU, Softmax
     cfg = Config(num_global_rounds=800, dimension=20, num_classes=5, hidden_size=20)
-    cfg.lr = 0.05
+    cfg.lr = 0.005
     
     # Use ill-conditioned data to make it harder? Or just standard?
     # User asked for "Non-Convex" case. Neural net is inherently non-convex.
