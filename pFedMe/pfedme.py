@@ -275,7 +275,7 @@ def generate_classification_data(num_clients, dimension, num_classes, data_per_c
 
 def run_mlr_experiment():
     print("\n=== Running Strongly Convex (MLR) Experiment ===")
-    cfg = Config(num_global_rounds=100, dimension=20, num_classes=5, hidden_size=0) # Hidden=0 -> MLR
+    cfg = Config(num_global_rounds=800, dimension=20, num_classes=5, hidden_size=0) # Hidden=0 -> MLR
     cfg.lr = 0.05
     
     data = generate_classification_data(
@@ -292,7 +292,7 @@ def run_mlr_experiment():
 def run_dnn_experiment():
     print("\n=== Running Non-Convex (DNN) Experiment ===")
     # DNN: Hidden=20, ReLU, Softmax
-    cfg = Config(num_global_rounds=100, dimension=20, num_classes=5, hidden_size=20)
+    cfg = Config(num_global_rounds=800, dimension=20, num_classes=5, hidden_size=20)
     cfg.lr = 0.05
     
     # Use ill-conditioned data to make it harder? Or just standard?
